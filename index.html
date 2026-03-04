@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="bn">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SMSCDR Proxy Viewer (Static)</title>
+  <style>
+    :root{color-scheme:light dark}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;line-height:1.4}
+    h1{margin:0 0 12px;font-size:20px}
+    .card{max-width:980px;border:1px solid rgba(127,127,127,.35);border-radius:12px;padding:16px}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    label{display:block;font-size:12px;opacity:.85;margin-bottom:6px}
+    input{width:260px;max-width:100%;padding:10px;border-radius:10px;border:1px solid rgba(127,127,127,.35);background:transparent}
+    button{padding:10px 14px;border-radius:10px;border:1px solid rgba(127,127,127,.35);background:transparent;cursor:pointer}
+    button:hover{background:rgba(127,127,127,.12)}
+    pre{white-space:pre-wrap;word-break:break-word;background:rgba(127,127,127,.10);padding:12px;border-radius:12px;overflow:auto;max-height:55vh}
+    .muted{opacity:.8;font-size:13px}
+    .warn{margin-top:12px;padding:10px 12px;border-left:4px solid #b45309;background:rgba(180,83,9,.12);border-radius:10px}
+    .ok{margin-top:12px;padding:10px 12px;border-left:4px solid #047857;background:rgba(4,120,87,.12);border-radius:10px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>GitHub Pages (HTML) থেকে API রেসপন্স দেখা</h1>
+    <p class="muted">
+      নোট: GitHub Pages এ PHP রান হয় না। তাই এই পেজটা JavaScript দিয়ে সরাসরি upstream URL এ request করে রেসপন্স দেখায়।
+      যদি upstream এ CORS বন্ধ থাকে তাহলে ব্রাউজার ব্লক করবে—সেক্ষেত্রে proxy (Cloudflare Worker/Vercel) লাগবে।
+    </p>
+
+    <div class="row" style="align-items:flex-end;margin:14px 0 10px">
+      <div>
+        <label for="session">session (ঐচ্ছিক)</label>
+        <input id="session" placeholder="PHPSESSID বা session token" />
+      </div>
+      <div>
+        <label for="params">query params (ঐচ্ছিক)</label>
+        <input id="params" placeholder="example: from=2026-01-01&to=2026-01-02" />
+      </div>
+      <div>
+        <button id="btn">Fetch</button>
+      </div>
+    </div>
+
+    <div id="status" class="muted"></div>
+    <pre id="out">এখানে রেসপন্স দেখা যাবে...</pre>
+
+    <div id="cors" class="warn" style="display:none">
+      <b>CORS ব্লক হয়েছে।</b>
+      ব্রাউজার সরাসরি <code>http://54.39.104.241</code> ডোমেইনে request করতে দিচ্ছে না।
+      এটা ঠিক করতে আপনাকে একটা proxy লাগবে (Cloudflare Worker / Vercel Function / নিজের PHP hosting)।
+    </div>
+
+    <div class="ok" style="margin-top:14px">
+      <b>Upstream URL:</b>
+      <code id="url"></code>
+    </div>
+  </div>
+
+  <script>
+    const BASE = 'http://54.39.104.241/ints/agent/res/data_smscdr.php';
+
+    const elSession = document.getElementById('session');
+    const elParams = document.getElementById('params');
+    const elOut = document.getElementById('out');
+    const elStatus = document.getElementById('status');
+    const elCors = document.getElementById('cors');
+    const elUrl = document.getElementById('url');
+
+    function buildUrl() {
+      const raw = (elParams.value || '').trim();
+      const url = new URL(BASE);
+      if (raw) {
+        const sp = new URLSearchParams(raw);
+        for (const [k, v] of sp.entries()) url.searchParams.set(k, v);
+      }
+      return url;
+    }
+
+    async function fetchData() {
+      elCors.style.display = 'none';
+      elStatus.textContent = 'Requesting...';
+      elOut.textContent = '';
+
+      const url = buildUrl();
+      elUrl.textContent = url.toString();
+
+      const headers = {
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'X-Requested-With': 'XMLHttpRequest'
+      };
+
+      const sess = (elSession.value || '').trim();
+      if (sess) {
+        // Browser JS থেকে অন্য ডোমেইনে Cookie header সেট করা যায় না।
+        // এই ফিল্ডটা শুধু reference হিসেবে রাখা হলো।
+        headers['X-Session'] = sess;
+      }
+
+      try {
+        const res = await fetch(url.toString(), { method: 'GET', headers });
+        const text = await res.text();
+
+        elStatus.textContent = `HTTP ${res.status}`;
+
+        try {
+          const json = JSON.parse(text);
+          elOut.textContent = JSON.stringify(json, null, 2);
+        } catch {
+          elOut.textContent = text;
+        }
+      } catch (e) {
+        elStatus.textContent = 'Request failed';
+        elOut.textContent = String(e);
+        if (String(e).toLowerCase().includes('cors') || String(e).toLowerCase().includes('failed to fetch')) {
+          elCors.style.display = 'block';
+        }
+      }
+    }
+
+    document.getElementById('btn').addEventListener('click', fetchData);
+    elUrl.textContent = buildUrl().toString();
+  </script>
+</body>
+</html>

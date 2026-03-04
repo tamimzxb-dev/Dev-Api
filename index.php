@@ -2,6 +2,9 @@
 
 declare(strict_types=1);
 
+// GitHub Pages এ PHP রান হয় না। এই ফাইলটা শুধু PHP hosting এ কাজ করবে।
+// GitHub Pages এর জন্য index.html ব্যবহার করুন।
+
 $remoteBase = 'http://54.39.104.241/ints/agent/res/data_smscdr.php';
 $query = $_GET;
 $remoteUrl = $remoteBase;
