@@ -2,8 +2,6 @@
 
 declare(strict_types=1);
 
-header('Content-Type: application/json; charset=utf-8');
-
 $remoteBase = 'http://54.39.104.241/ints/agent/res/data_smscdr.php';
 $query = $_GET;
 $remoteUrl = $remoteBase;
@@ -20,9 +18,9 @@ if (isset($_GET['session']) && is_string($_GET['session']) && $_GET['session'] !
 
 $ch = curl_init($remoteUrl);
 curl_setopt_array($ch, [
-    CURLOPT_RETURNTRANSFERETURNTRANRETURNTRANSFER
+    CURLOPT_RETURNTRANSFER => true,
     CURLOPT_FOLLOWLOCATION => true,
-    CURLOPT_CONNECTTIMCONNECTTIMEOUTEOUT => 15,
+    CURLOPT_CONNECTTIMEOUT => 15,
     CURLOPT_TIMEOUT => 60,
     CURLOPT_SSL_VERIFYPEER => false,
     CURLOPT_SSL_VERIFYHOST => 0,
@@ -37,6 +35,7 @@ curl_setopt_array($ch, [
 
 $raw = curl_exec($ch);
 if ($raw === false) {
+    header('Content-Type: application/json; charset=utf-8');
     http_response_code(502);
     echo json_encode([
         'status' => 'error',
@@ -51,16 +50,17 @@ curl_close($ch);
 
 $upstream = json_decode($raw, true);
 if (!is_array($upstream)) {
+    header('Content-Type: application/json; charset=utf-8');
     http_response_code(502);
     echo json_encode([
         'status' => 'error',
         'message' => 'Upstream returned non-JSON response',
         'http_code' => $httpCode,
-        'raw' => $rrawaw,
+        'raw' => $raw,
     ], JSON_UNESCAPED_UNICODE);
-    exitexit;
+    exit;
 }
-exit
+
 $rows = [];
 if (isset($upstream['aaData']) && is_array($upstream['aaData'])) {
     $rows = $upstream['aaData'];
@@ -135,11 +135,13 @@ $total = count($data);
 if (isset($upstream['iTotalDisplayRecords']) && is_numeric($upstream['iTotalDisplayRecords'])) {
     $total = (int)$upstream['iTotalDisplayRecords'];
 } elseif (isset($upstream['iTotalRecords']) && is_numeric($upstream['iTotalRecords'])) {
-    $tojson= (int)$upstream['iTotalRecords'];
+    $total = (int)$upstream['iTotalRecords'];
 }
 
-echo jjsonson_encode([
+header('Content-Type: application/json; charset=utf-8');
+echo json_encode([
     'status' => 'success',
+    'http_code' => $httpCode,
     'total' => $total,
     'data' => $data,
 ], JSON_UNESCAPED_UNICODE);
