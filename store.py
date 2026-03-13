@@ -4,8 +4,11 @@ import os
 import re
 import sqlite3
 import time
+import urllib.parse
+import urllib.request
 from contextlib import closing
-from typing import Optional, List, Tuple, Iterable, Dict
+from threading import Thread
+from typing import Optional, List, Tuple, Dict
 
 from telegram import (
     Update,
@@ -26,11 +29,19 @@ from telegram.ext import (
     filters,
 )
 
+try:
+    from telethon import TelegramClient, events
+except ImportError as e:
+    raise RuntimeError("Missing dependency 'telethon'. Install: pip install telethon") from e
+
 # =========================================================
 # CONFIG
 # =========================================================
-# For safety, keep your bot token out of source control.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+
+TG_API_ID = int(os.getenv("TG_API_ID", "0") or 0)
+TG_API_HASH = os.getenv("TG_API_HASH", "")
+TG_SESSION = os.getenv("TG_SESSION", "userbot")
 
 OWNER_IDS = {5422839433}
 
@@ -42,21 +53,19 @@ FORCE_JOIN_CHANNELS = [
     },
 ]
 
-# Group ID where OTPs are posted (Supergroup IDs are usually negative like -100...)
-DEFAULT_MONITOR_CHAT_IDS = {-1003528209997}
+MONITOR_CHAT_ID = int(os.getenv("MONITOR_CHAT_ID", "-1003528209997"))
 
-DB_NAME = "number_store.db"
+DB_NAME = os.getenv("DB_NAME", "number_store.db")
 DEFAULT_BATCH_LIMIT = 5
 BROADCAST_DELAY = 0.04
 USED_LOG_TTL_SECONDS = 1000
 CLEANUP_CHECK_INTERVAL = 60
 
-# Stronger Logging
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("storebot")
+logger = logging.getLogger("store")
 
 # =========================================================
 # CONVERSATION STATES
@@ -68,7 +77,7 @@ ADDNUMBER_PLATFORM, ADDNUMBER_COUNTRY, ADDNUMBER_FILE = range(3)
 # =========================================================
 
 def get_conn():
-    return sqlite3.connect(DB_NAME)
+    return sqlite3.connect(DB_NAME, timeout=30)
 
 
 def init_db():
@@ -92,15 +101,6 @@ def init_db():
             """
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-        )
-        # MONITOR CHATS
-        cur.execute(
-            """
-        CREATE TABLE IF NOT EXISTS monitor_chats (
-            chat_id INTEGER PRIMARY KEY,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
@@ -165,15 +165,11 @@ def init_db():
         """
         )
 
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_masked_number ON used_logs (masked_number)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_number ON used_logs (raw_number)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_used_masked ON used_logs (masked_number)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_used_raw ON used_logs (raw_number)")
         conn.commit()
 
     seed_defaults()
-
-    # Ensure default monitor chats exist in DB (so /addchatid isn't required)
-    for cid in DEFAULT_MONITOR_CHAT_IDS:
-        add_monitor_chat(cid)
 
 
 def seed_defaults():
@@ -197,21 +193,18 @@ def clean_number(number_str: str) -> str:
     return "".join(ch for ch in s if ch.isdigit())
 
 
-def mask_number_custom(number_str):
+def mask_number_custom(number_str: str) -> str:
     s = clean_number(number_str)
     length = len(s)
     if length >= 13:
         return f"{s[:5]}SHU{s[-5:]}"
-    elif length == 12:
-        return f"{s[:4]}SHU{s[-4:]}"
-    elif length == 11:
+    elif length in (11, 12):
         return f"{s[:4]}SHU{s[-4:]}"
     elif length == 10:
         return f"{s[:3]}SHU{s[-4:]}"
     elif length in (8, 9):
         return f"{s[:3]}SHU{s[-3:]}"
-    else:
-        return s
+    return s
 
 
 def fmt_user_number(raw_number: str, prefix_enabled: bool) -> str:
@@ -425,20 +418,6 @@ def cleanup_old_used_logs():
         return deleted
 
 
-def add_monitor_chat(chat_id: int):
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO monitor_chats (chat_id) VALUES (?)", (chat_id,))
-        conn.commit()
-
-
-def get_monitor_chats() -> List[int]:
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT chat_id FROM monitor_chats ORDER BY chat_id")
-        return [x[0] for x in cur.fetchall()]
-
-
 def add_admin_db(user_id: int):
     with closing(get_conn()) as conn:
         cur = conn.cursor()
@@ -457,13 +436,6 @@ def admin_list() -> List[int]:
     with closing(get_conn()) as conn:
         cur = conn.cursor()
         cur.execute("SELECT user_id FROM admins ORDER BY user_id ASC")
-        return [x[0] for x in cur.fetchall()]
-
-
-def get_all_user_ids() -> List[int]:
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM users ORDER BY user_id ASC")
         return [x[0] for x in cur.fetchall()]
 
 
@@ -545,25 +517,6 @@ async def joined_all(bot, user_id: int) -> bool:
 
 
 # =========================================================
-# ALERTS
-# =========================================================
-
-async def send_stock_out_alert(app: Application, platform_name: str, country_name: str):
-    text = (
-        "⚠️ <b>STOCK OUT ALERT</b>\n\n"
-        f"Platform: <b>{escape_html(platform_name)}</b>\n"
-        f"Country: <b>{escape_html(country_name)}</b>\n"
-        "Status: <b>Out of stock</b>"
-    )
-    targets = set(OWNER_IDS) | set(admin_list()) | set(get_monitor_chats())
-    for chat_id in targets:
-        try:
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.warning("Alert send failed to %s: %s", chat_id, e)
-
-
-# =========================================================
 # HELPERS
 # =========================================================
 
@@ -611,217 +564,6 @@ async def on_startup(app: Application):
 
 
 # =========================================================
-# MONITOR SYSTEM
-# =========================================================
-
-MASKED_RE = re.compile(r"\b\d{3,}SHU\d{3,}\b")
-PHONE_RE = re.compile(r"(?:\+|00)?\d[\d\s\-\(\)]{6,}\d")
-OTP_RE = re.compile(r"\b\d{4,8}\b")
-
-OTP_CONTEXT_TTL_SECONDS = 180
-_last_context_by_chat: Dict[int, Tuple[float, int, str]] = {}
-
-
-def _set_last_context(chat_id: int, user_id: int, raw_number: str):
-    _last_context_by_chat[chat_id] = (time.time(), user_id, raw_number)
-
-
-def _get_last_context(chat_id: int) -> Optional[Tuple[int, str]]:
-    ctx = _last_context_by_chat.get(chat_id)
-    if not ctx:
-        return None
-
-    ts, user_id, raw_number = ctx
-    if time.time() - ts > OTP_CONTEXT_TTL_SECONDS:
-        _last_context_by_chat.pop(chat_id, None)
-        return None
-
-    return user_id, raw_number
-
-
-def _extract_text_and_button_texts(update: Update) -> Tuple[str, List[str]]:
-    msg = update.effective_message
-    if not msg:
-        return "", []
-
-    text = msg.text or msg.caption or ""
-
-    button_texts: List[str] = []
-    if msg.reply_markup and getattr(msg.reply_markup, "inline_keyboard", None):
-        for row in msg.reply_markup.inline_keyboard:
-            for btn in row:
-                if btn.text:
-                    button_texts.append(btn.text)
-
-    return text, button_texts
-
-
-def _extract_candidate_raw_numbers(text: str) -> List[Tuple[str, str]]:
-    """Returns (raw_digits, matched_text) pairs."""
-    candidates: List[Tuple[str, str]] = []
-    for m in PHONE_RE.finditer(text):
-        matched = m.group(0)
-        raw = clean_number(matched)
-        if 8 <= len(raw) <= 15:
-            candidates.append((raw, matched))
-
-    # de-duplicate by raw number (keep first matched_text)
-    uniq: List[Tuple[str, str]] = []
-    seen = set()
-    for raw, matched in candidates:
-        if raw in seen:
-            continue
-        seen.add(raw)
-        uniq.append((raw, matched))
-    return uniq
-
-
-def _find_user_by_masked(masked: str) -> Optional[Tuple[int, str]]:
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, raw_number FROM used_logs WHERE masked_number=?", (masked,))
-        row = cur.fetchone()
-        return (int(row[0]), row[1]) if row else None
-
-
-def _find_user_by_raw(raw: str) -> Optional[Tuple[int, str]]:
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT user_id, raw_number FROM used_logs WHERE raw_number=? ORDER BY id DESC LIMIT 1",
-            (raw,),
-        )
-        row = cur.fetchone()
-        return (int(row[0]), row[1]) if row else None
-
-
-def _remove_tokens(text: str, tokens: Iterable[str]) -> str:
-    out = text
-    for t in tokens:
-        if t:
-            out = out.replace(t, " ")
-    out = re.sub(r"[ \t]+", " ", out)
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    return out.strip()
-
-
-async def monitor_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detects assigned numbers in a group and forwards the OTP/message to the correct user's inbox."""
-
-    chat = update.effective_chat
-    if not chat:
-        return
-
-    chat_id = chat.id
-
-    monitor_chats = set(get_monitor_chats()) | set(DEFAULT_MONITOR_CHAT_IDS)
-    if chat_id not in monitor_chats:
-        return
-
-    text, button_texts = _extract_text_and_button_texts(update)
-    if not text and not button_texts:
-        return
-
-    masked_matches = list(dict.fromkeys(MASKED_RE.findall(text)))
-    raw_candidates = _extract_candidate_raw_numbers(text)
-
-    # Some OTP bots keep code only on button texts
-    otps_from_buttons = []
-    for bt in button_texts:
-        otps_from_buttons.extend(OTP_RE.findall(bt))
-    otps_from_buttons = list(dict.fromkeys(otps_from_buttons))
-
-    # If message has no number at all but contains an OTP, try using last context
-    if not masked_matches and not raw_candidates:
-        otp_only = OTP_RE.findall(text) if text else []
-        otp_only = list(dict.fromkeys(otp_only))
-        otp_only.extend([x for x in otps_from_buttons if x not in otp_only])
-        if not otp_only:
-            return
-
-        ctx = _get_last_context(chat_id)
-        if not ctx:
-            return
-
-        user_id, raw_number = ctx
-        prefix = get_prefix_enabled(user_id)
-        display_num = fmt_user_number(raw_number, prefix)
-
-        content = text.strip() if text else ""
-        content = (content + "\n\nOTP: " + ", ".join(otp_only)).strip() if otp_only else content
-
-        msg = (
-            f"✅ OTP/message received for <code>{escape_html(display_num)}</code>\n\n"
-            f"💬 Content:\n<code>{escape_html(content or '(no text)')}</code>"
-        )
-
-        try:
-            await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.warning("Failed to send PM to user %s: %s", user_id, e)
-        return
-
-    logger.info(
-        "Monitor: chat_id=%s masked=%s raw=%s",
-        chat_id,
-        len(masked_matches),
-        len(raw_candidates),
-    )
-
-    matches: List[Tuple[int, str, List[str]]] = []
-
-    # 1) Match by masked number like 8490SHU5934
-    for masked in masked_matches:
-        found = _find_user_by_masked(masked)
-        if found:
-            user_id, raw_number = found
-            matches.append((user_id, raw_number, [masked]))
-
-    # 2) Match by raw phone number like +84901957336
-    for raw, matched_text in raw_candidates:
-        found = _find_user_by_raw(raw)
-        if found:
-            user_id, raw_number = found
-            matches.append((user_id, raw_number, [matched_text]))
-
-    if not matches:
-        return
-
-    # De-duplicate (user_id, raw_number)
-    seen = set()
-    uniq_matches = []
-    for user_id, raw_number, tokens in matches:
-        key = (user_id, raw_number)
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq_matches.append((user_id, raw_number, tokens))
-
-    for user_id, raw_number, tokens in uniq_matches:
-        _set_last_context(chat_id, user_id, raw_number)
-
-        prefix = get_prefix_enabled(user_id)
-        display_num = fmt_user_number(raw_number, prefix)
-
-        content = _remove_tokens(text, tokens)
-        if otps_from_buttons:
-            content = (content + "\n\nOTP: " + ", ".join(otps_from_buttons)).strip()
-
-        if not content:
-            content = "(no text)"
-
-        msg = (
-            f"✅ OTP/message received for <code>{escape_html(display_num)}</code>\n\n"
-            f"💬 Content:\n<code>{escape_html(content)}</code>"
-        )
-
-        try:
-            await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.warning("Failed to send PM to user %s: %s", user_id, e)
-
-
-# =========================================================
 # USER COMMANDS
 # =========================================================
 
@@ -850,7 +592,6 @@ async def user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (update.message.text or "").strip()
 
-    # Force Join Check
     if not await joined_all(context.bot, user.id):
         await update.message.reply_text(
             "⚠️ Access Denied! Join channels first.",
@@ -908,12 +649,9 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         assigned = assign_batch_to_user(user.id, platform_name, country_name, limit)
         if not assigned:
             await query.edit_message_text("❌ Out of stock.")
-            await send_stock_out_alert(context.application, platform_name, country_name)
             return
         prefix = get_prefix_enabled(user.id)
         await edit_number_message(query, platform_name, country_name, assigned, prefix)
-        if count_stock(platform_name, country_name) == 0:
-            await send_stock_out_alert(context.application, platform_name, country_name)
         return
 
     if data.startswith("change|"):
@@ -946,11 +684,7 @@ CMD_TEXT = """<b>--- Admin Panel ---</b>
 /addnumber
 /removenumber Platform | Country
 /numberlimit Plat | Coun | Limit
-/addchatid [chat_id]
 /block [id] /unblock [id]
-/seestatus [id]
-/all [msg]
-/statusall
 """
 
 
@@ -1086,16 +820,6 @@ async def numberlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Limit set.")
 
 
-async def addchatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        return
-    cid = int(context.args[0])
-    add_monitor_chat(cid)
-    await update.message.reply_text(f"Monitor added: {cid}")
-
-
 async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -1112,35 +836,169 @@ async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Unblocked.")
 
 
-async def seestatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    uid = int(context.args[0])
-    await update.message.reply_text(f"Status checked for {uid}")
-
-
-async def all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    text = " ".join(context.args)
-    await update.message.reply_text("Broadcast started.")
-
-
-async def statusall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    await update.message.reply_text("Stats...")
-
-
 # =========================================================
-# MAIN
+# USERBOT BRIDGE (GROUP LISTENER)
 # =========================================================
 
-def main():
+MASKED_RE = re.compile(r"\b\d{3,}SHU\d{3,}\b")
+PHONE_RE = re.compile(r"(?:\+|00)?\d[\d\s\-\(\)]{6,}\d")
+
+
+def _extract_raw_candidates(text: str) -> List[Tuple[str, str]]:
+    candidates: List[Tuple[str, str]] = []
+    for m in PHONE_RE.finditer(text):
+        matched = m.group(0)
+        raw = clean_number(matched)
+        if 8 <= len(raw) <= 15:
+            candidates.append((raw, matched))
+
+    uniq: List[Tuple[str, str]] = []
+    seen = set()
+    for raw, matched in candidates:
+        if raw in seen:
+            continue
+        seen.add(raw)
+        uniq.append((raw, matched))
+    return uniq
+
+
+def _remove_tokens(text: str, tokens: List[str]) -> str:
+    out = text
+    for t in tokens:
+        if t:
+            out = out.replace(t, " ")
+    out = re.sub(r"[ \t]+", " ", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def _find_user_by_masked(masked: str) -> Optional[Tuple[int, str]]:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, raw_number FROM used_logs WHERE masked_number=?", (masked,))
+        row = cur.fetchone()
+        return (int(row[0]), row[1]) if row else None
+
+
+def _find_user_by_raw(raw: str) -> Optional[Tuple[int, str]]:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, raw_number FROM used_logs WHERE raw_number=? ORDER BY id DESC LIMIT 1", (raw,))
+        row = cur.fetchone()
+        return (int(row[0]), row[1]) if row else None
+
+
+def _bot_send_message_sync(chat_id: int, text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        resp.read()
+
+
+async def _bot_send_message(chat_id: int, text: str):
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _bot_send_message_sync, chat_id, text)
+
+
+async def run_userbot_bridge():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set. Set environment variable BOT_TOKEN.")
+        raise RuntimeError("BOT_TOKEN is not set")
+    if not TG_API_ID or not TG_API_HASH:
+        raise RuntimeError("TG_API_ID / TG_API_HASH is not set")
 
-    init_db()
+    client = TelegramClient(TG_SESSION, TG_API_ID, TG_API_HASH)
+
+    last_seen: Dict[Tuple[int, str], float] = {}
+    dedup_ttl = 20.0
+
+    @client.on(events.NewMessage(chats=[MONITOR_CHAT_ID]))
+    async def handler(event):
+        text = event.raw_text or ""
+        if not text:
+            return
+
+        masked_matches = list(dict.fromkeys(MASKED_RE.findall(text)))
+        raw_candidates = _extract_raw_candidates(text)
+
+        if not masked_matches and not raw_candidates:
+            return
+
+        sent_to_users = set()
+
+        for masked in masked_matches:
+            found = _find_user_by_masked(masked)
+            if not found:
+                continue
+
+            user_id, raw_number = found
+            if user_id in sent_to_users:
+                continue
+
+            now = time.time()
+            key = (user_id, masked)
+            if now - last_seen.get(key, 0.0) < dedup_ttl:
+                continue
+            last_seen[key] = now
+
+            prefix = get_prefix_enabled(user_id)
+            display_num = fmt_user_number(raw_number, prefix)
+
+            content = _remove_tokens(text, [masked])
+            msg = (
+                f"✅ Message received for <code>{escape_html(display_num)}</code>\n\n"
+                f"💬 Content:\n<code>{escape_html(content or '(no text)')}</code>"
+            )
+
+            await _bot_send_message(user_id, msg)
+            sent_to_users.add(user_id)
+
+        for raw, matched_text in raw_candidates:
+            found = _find_user_by_raw(raw)
+            if not found:
+                continue
+
+            user_id, raw_number = found
+            if user_id in sent_to_users:
+                continue
+
+            now = time.time()
+            key = (user_id, raw)
+            if now - last_seen.get(key, 0.0) < dedup_ttl:
+                continue
+            last_seen[key] = now
+
+            prefix = get_prefix_enabled(user_id)
+            display_num = fmt_user_number(raw_number, prefix)
+
+            content = _remove_tokens(text, [matched_text])
+            msg = (
+                f"✅ Message received for <code>{escape_html(display_num)}</code>\n\n"
+                f"💬 Content:\n<code>{escape_html(content or '(no text)')}</code>"
+            )
+
+            await _bot_send_message(user_id, msg)
+            sent_to_users.add(user_id)
+
+    logger.info("Userbot bridge running. monitor_chat_id=%s", MONITOR_CHAT_ID)
+    await client.start()
+    await client.run_until_disconnected()
+
+
+# =========================================================
+# BOT MAIN
+# =========================================================
+
+def run_bot_polling():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
     addnumber_conv = ConversationHandler(
@@ -1165,20 +1023,23 @@ def main():
     app.add_handler(addnumber_conv)
     app.add_handler(CommandHandler("removenumber", removenumber_cmd))
     app.add_handler(CommandHandler("numberlimit", numberlimit_cmd))
-    app.add_handler(CommandHandler("addchatid", addchatid_cmd))
     app.add_handler(CommandHandler("block", block_cmd))
     app.add_handler(CommandHandler("unblock", unblock_cmd))
-    app.add_handler(CommandHandler("seestatus", seestatus_cmd))
-    app.add_handler(CommandHandler("all", all_cmd))
-    app.add_handler(CommandHandler("statusall", statusall_cmd))
 
     app.add_handler(CallbackQueryHandler(cb_handler))
-
-    # HANDLERS
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, user_text))
 
-    print("Bot running...")
-    app.run_polling()
+    logger.info("Bot polling started")
+    app.run_polling(stop_signals=None)
+
+
+def main():
+    init_db()
+
+    bot_thread = Thread(target=run_bot_polling, daemon=True)
+    bot_thread.start()
+
+    asyncio.run(run_userbot_bridge())
 
 
 if __name__ == "__main__":
