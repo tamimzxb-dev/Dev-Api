@@ -5,7 +5,7 @@ import re
 import sqlite3
 import time
 from contextlib import closing
-from typing import Optional, List, Tuple, Iterable
+from typing import Optional, List, Tuple, Iterable, Dict
 
 from telegram import (
     Update,
@@ -619,7 +619,7 @@ PHONE_RE = re.compile(r"(?:\+|00)?\d[\d\s\-\(\)]{6,}\d")
 OTP_RE = re.compile(r"\b\d{4,8}\b")
 
 OTP_CONTEXT_TTL_SECONDS = 180
-_last_context_by_chat: dict[int, Tuple[float, int, str]] = {}
+_last_context_by_chat: Dict[int, Tuple[float, int, str]] = {}
 
 
 def _set_last_context(chat_id: int, user_id: int, raw_number: str):
@@ -1176,7 +1176,6 @@ def main():
 
     # HANDLERS
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, user_text))
-    app.add_handler(MessageHandler(filters.ALL & (filters.ChatType.GROUPS | filters.ChatType.CHANNEL), monitor_group_message))
 
     print("Bot running...")
     app.run_polling()
