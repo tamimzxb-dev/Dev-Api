@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from contextlib import closing
 from typing import Optional, List, Tuple, Iterable
 
@@ -617,6 +618,26 @@ MASKED_RE = re.compile(r"\b\d{3,}SHU\d{3,}\b")
 PHONE_RE = re.compile(r"(?:\+|00)?\d[\d\s\-\(\)]{6,}\d")
 OTP_RE = re.compile(r"\b\d{4,8}\b")
 
+OTP_CONTEXT_TTL_SECONDS = 180
+_last_context_by_chat: dict[int, Tuple[float, int, str]] = {}
+
+
+def _set_last_context(chat_id: int, user_id: int, raw_number: str):
+    _last_context_by_chat[chat_id] = (time.time(), user_id, raw_number)
+
+
+def _get_last_context(chat_id: int) -> Optional[Tuple[int, str]]:
+    ctx = _last_context_by_chat.get(chat_id)
+    if not ctx:
+        return None
+
+    ts, user_id, raw_number = ctx
+    if time.time() - ts > OTP_CONTEXT_TTL_SECONDS:
+        _last_context_by_chat.pop(chat_id, None)
+        return None
+
+    return user_id, raw_number
+
 
 def _extract_text_and_button_texts(update: Update) -> Tuple[str, List[str]]:
     msg = update.effective_message
@@ -710,7 +731,34 @@ async def monitor_group_message(update: Update, context: ContextTypes.DEFAULT_TY
         otps_from_buttons.extend(OTP_RE.findall(bt))
     otps_from_buttons = list(dict.fromkeys(otps_from_buttons))
 
+    # If message has no number at all but contains an OTP, try using last context
     if not masked_matches and not raw_candidates:
+        otp_only = OTP_RE.findall(text) if text else []
+        otp_only = list(dict.fromkeys(otp_only))
+        otp_only.extend([x for x in otps_from_buttons if x not in otp_only])
+        if not otp_only:
+            return
+
+        ctx = _get_last_context(chat_id)
+        if not ctx:
+            return
+
+        user_id, raw_number = ctx
+        prefix = get_prefix_enabled(user_id)
+        display_num = fmt_user_number(raw_number, prefix)
+
+        content = text.strip() if text else ""
+        content = (content + "\n\nOTP: " + ", ".join(otp_only)).strip() if otp_only else content
+
+        msg = (
+            f"✅ OTP/message received for <code>{escape_html(display_num)}</code>\n\n"
+            f"💬 Content:\n<code>{escape_html(content or '(no text)')}</code>"
+        )
+
+        try:
+            await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.warning("Failed to send PM to user %s: %s", user_id, e)
         return
 
     logger.info(
@@ -750,6 +798,8 @@ async def monitor_group_message(update: Update, context: ContextTypes.DEFAULT_TY
         uniq_matches.append((user_id, raw_number, tokens))
 
     for user_id, raw_number, tokens in uniq_matches:
+        _set_last_context(chat_id, user_id, raw_number)
+
         prefix = get_prefix_enabled(user_id)
         display_num = fmt_user_number(raw_number, prefix)
 
@@ -1126,7 +1176,7 @@ def main():
 
     # HANDLERS
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, user_text))
-    app.add_handler(MessageHandler(filters.ALL & filters.ChatType.GROUPS, monitor_group_message))
+    app.add_handler(MessageHandler(filters.ALL & (filters.ChatType.GROUPS | filters.ChatType.CHANNEL), monitor_group_message))
 
     print("Bot running...")
     app.run_polling()
